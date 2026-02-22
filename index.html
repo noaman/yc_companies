@@ -145,12 +145,29 @@
         .search-box svg {
             position: absolute;
             left: 12px;
-            top: 50%;
-            transform: translateY(-50%);
+            top: 11px;
             width: 16px;
             height: 16px;
             fill: var(--text-muted);
             pointer-events: none;
+        }
+
+        .search-hint {
+            margin-top: 6px;
+            font-size: 11px;
+            color: var(--text-muted);
+            line-height: 1.4;
+        }
+
+        .search-hint kbd {
+            display: inline-block;
+            padding: 1px 5px;
+            font-size: 10px;
+            font-family: inherit;
+            color: var(--text-secondary);
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 3px;
         }
 
         .search-input {
@@ -935,7 +952,8 @@
     <aside class="sidebar" id="sidebar">
         <div class="search-box">
             <svg viewBox="0 0 16 16"><path d="M11.5 7a4.499 4.499 0 11-8.998 0A4.499 4.499 0 0111.5 7zm-.82 4.74a6 6 0 111.06-1.06l3.04 3.04a.75.75 0 11-1.06 1.06l-3.04-3.04z"/></svg>
-            <input type="text" class="search-input" id="searchInput" placeholder="Search e.g. AI + media, fintech + payments..." autofocus>
+            <input type="text" class="search-input" id="searchInput" placeholder="Search e.g. (AI | fintech) + legal..." autofocus>
+            <div class="search-hint"><kbd>+</kbd> <kbd>,</kbd> <kbd>and</kbd> = AND &nbsp;&middot;&nbsp; <kbd>|</kbd> <kbd>or</kbd> = OR &nbsp;&middot;&nbsp; <kbd>( )</kbd> = group</div>
         </div>
         <div id="activeFilters"></div>
         <div id="filterSections"></div>
@@ -57324,22 +57342,94 @@ function renderActiveFilters() {
     container.innerHTML = `<div class="active-filters">${chips.join('')}<button class="clear-all-btn" onclick="clearAllFilters()">Clear all</button></div>`;
 }
 
+function tokenizeQuery(input) {
+    const tokens = [];
+    let i = 0;
+    while (i < input.length) {
+        const ch = input[i];
+        if (ch === ' ' || ch === '\t') { i++; continue; }
+        if (ch === '(') { tokens.push({ type: 'LPAREN' }); i++; continue; }
+        if (ch === ')') { tokens.push({ type: 'RPAREN' }); i++; continue; }
+        if (ch === '|') { tokens.push({ type: 'OR' }); i++; continue; }
+        if (ch === '+' || ch === ',') { tokens.push({ type: 'AND' }); i++; continue; }
+        let word = '';
+        while (i < input.length && !' \t()|+,'.includes(input[i])) {
+            word += input[i]; i++;
+        }
+        if (word) {
+            const lower = word.toLowerCase();
+            if (lower === 'or') tokens.push({ type: 'OR' });
+            else if (lower === 'and') tokens.push({ type: 'AND' });
+            else tokens.push({ type: 'WORD', value: lower });
+        }
+    }
+    return tokens;
+}
+
+function parseOrExpr(p) {
+    let node = parseAndExpr(p);
+    while (p.pos < p.tokens.length && p.tokens[p.pos].type === 'OR') {
+        p.pos++;
+        const right = parseAndExpr(p);
+        node = { type: 'or', left: node, right };
+    }
+    return node;
+}
+
+function parseAndExpr(p) {
+    let node = parseAtom(p);
+    while (p.pos < p.tokens.length) {
+        if (p.tokens[p.pos].type === 'AND') {
+            p.pos++;
+            node = { type: 'and', left: node, right: parseAtom(p) };
+        } else if (p.tokens[p.pos].type === 'WORD' || p.tokens[p.pos].type === 'LPAREN') {
+            node = { type: 'and', left: node, right: parseAtom(p) };
+        } else {
+            break;
+        }
+    }
+    return node;
+}
+
+function parseAtom(p) {
+    if (p.pos < p.tokens.length && p.tokens[p.pos].type === 'LPAREN') {
+        p.pos++;
+        const node = parseOrExpr(p);
+        if (p.pos < p.tokens.length && p.tokens[p.pos].type === 'RPAREN') p.pos++;
+        return node;
+    }
+    const words = [];
+    while (p.pos < p.tokens.length && p.tokens[p.pos].type === 'WORD') {
+        words.push(p.tokens[p.pos].value);
+        p.pos++;
+    }
+    return { type: 'term', words };
+}
+
 function parseSearchQuery(raw) {
-    const q = raw.toLowerCase().trim();
-    if (!q) return [];
+    const q = raw.trim();
+    if (!q) return null;
+    const tokens = tokenizeQuery(q);
+    if (!tokens.length || tokens.every(t => t.type !== 'WORD')) return null;
+    return parseOrExpr({ tokens, pos: 0 });
+}
 
-    // Split on comma, plus, or the word "and" (with surrounding whitespace)
-    const groups = q.split(/[,+]|\band\b/i)
-        .map(s => s.trim())
-        .filter(Boolean);
-
-    // Each group is a phrase that must match (AND between groups).
-    // Within a group, all space-separated words must appear (AND within a group).
-    return groups.map(g => g.split(/\s+/).filter(Boolean));
+function matchesQuery(haystack, node) {
+    if (!node) return true;
+    switch (node.type) {
+        case 'term':
+            return node.words.length === 0 || node.words.every(w => haystack.includes(w));
+        case 'and':
+            return matchesQuery(haystack, node.left) && matchesQuery(haystack, node.right);
+        case 'or':
+            return matchesQuery(haystack, node.left) || matchesQuery(haystack, node.right);
+        default:
+            return true;
+    }
 }
 
 function applyFiltersAndSearch() {
-    const termGroups = parseSearchQuery(searchQuery);
+    const parsedQuery = parseSearchQuery(searchQuery);
 
     filteredCompanies = allCompanies.filter(c => {
         if (activeFilters.category.length && !activeFilters.category.includes(c.category)) return false;
@@ -57349,17 +57439,14 @@ function applyFiltersAndSearch() {
         if (activeFilters.status.length && !activeFilters.status.includes(c.ycdc_status)) return false;
         if (activeFilters.tag.length && !activeFilters.tag.some(t => (c.tags || []).includes(t))) return false;
 
-        if (termGroups.length) {
+        if (parsedQuery) {
             const haystack = [
                 c.company, c.one_liner, c.long_description, c.category,
                 c.industry, c.location, c.city, c.batch,
                 ...(c.tags || [])
             ].filter(Boolean).join(' ').toLowerCase();
 
-            // Every group must match: within each group, every word must appear
-            return termGroups.every(words =>
-                words.every(word => haystack.includes(word))
-            );
+            return matchesQuery(haystack, parsedQuery);
         }
 
         return true;
